@@ -105,6 +105,44 @@ flowchart TD
 前端细节：CQT 最低频率 27.5Hz（钢琴最低键），覆盖 88 个钢琴键；谐波堆叠把 0.5~7 倍频的
 能量沿频率轴平移到基频带并堆叠，让低音也能利用其泛音能量，提升复音转写精度。
 
+## 与原版模型的差异
+
+本仓库是 Spotify Basic Pitch（TensorFlow 官方实现）的 PyTorch 复现，网络结构与官方**逐层等价**，
+官方预训练权重已预先转换为 PyTorch 格式（`models/basic_pitch_pytorch_icassp_2022.pth`），
+使用者无需接触 TensorFlow。
+
+### 框架与权重
+
+| 项 | 原版（TensorFlow） | 本复现（PyTorch） |
+|----|-------------------|------------------|
+| 深度学习框架 | TensorFlow 2 / Keras | PyTorch |
+| 权重格式 | ICASSP_2022 saved_model | `.pth`（从原版转换而来） |
+| CQT 实现 | 自研 TensorFlow 层 | nnAudio `CQT2010v2` |
+| 参数量 | 相同结构 | 16,782 |
+
+### 逐层等价
+
+- CQT、谐波堆叠、三分支卷积的**层数 / 通道数 / 卷积核大小 / 激活函数**与原版一致；
+- BatchNorm 的 `eps=0.001` 与原版保持一致；
+- `normalized_log` 中的除零处理用 `torch.nan_to_num` 实现，等价于 TensorFlow 的 `div_no_nan`。
+
+### 关键适配点（TensorFlow → PyTorch）
+
+1. **stride 卷积的 padding**：TensorFlow 的 `padding="same"` 在 stride ≠ 1 时与 PyTorch 语义不同，
+   代码用 `F.pad` 手写 padding 公式逐层对齐（`model.py` 注释里有推导）。
+2. **输入 / 输出形状**：输入 `(batch, 43844)`（22.05kHz × 2 秒窗口），输出三张热力图
+   `(batch, 172, 88)`（note/onset）和 `(batch, 172, 264)`（contour）。
+3. **后处理兼容性**：新版 scipy 移除了 `scipy.signal.gaussian`，本仓库改用
+   `scipy.signal.windows.gaussian`。
+4. **精度差异**：与原版输出的差异主要来自浮点除法（`normalized_log`）及误差在网络中的传播，
+   数值极小，不影响转谱结果（见下方"测试结果"）。
+
+### 相对原版的新增内容
+
+- **人声/吉他分离扒谱管线**（`scripts/separate_and_transcribe.py`）：原版只做转写，
+  不含声源分离；本仓库在其前加了一层 Demucs 分离，支持"混音 → 分轨谱"。
+- 分窗 / 重叠拼接的推理流程按原版 `predict` 逻辑复刻为 PyTorch 实现。
+
 ## 测试结果
 
 ### 验证 1：与原版 TensorFlow 模型输出对比
