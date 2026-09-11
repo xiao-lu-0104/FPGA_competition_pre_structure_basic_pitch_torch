@@ -83,17 +83,17 @@ Basic Pitch 是一个"CQT + 谐波堆叠 + 三分支卷积"网络，总参数量
 
 ```mermaid
 flowchart TD
-    A[音频窗口<br/>22.05kHz × 2s = 43844 采样] --> B[CQT 变换<br/>fmin=27.5Hz, 每八度36 bins, hop=256]
-    B --> C[log 功率归一化 + BatchNorm]
-    C --> D[HarmonicStacking<br/>谐波堆叠 8 层<br/>0.5,1,2,3,4,5,6,7 倍频]
-    D --> F1[轮廓分支 conv_contour<br/>Conv8-8(3,39)→BN→ReLU→Conv8-1(5)→Sigmoid]
-    D --> F2[起始点分支 conv_onset_pre<br/>Conv8-32(5,stride1,3)→BN→ReLU]
-    F1 --> G1[contour 输出: 时间×264<br/>音高轮廓, 1/3 半音分辨率]
-    F1 -->|padding| H[音符分支 conv_note<br/>Conv1-32(7,stride1,3)→ReLU→Conv32-1(7,3)→Sigmoid]
-    H --> G3[note 输出: 时间×88<br/>88 个钢琴键的发音概率]
+    A["音频窗口 22.05kHz x 2s = 43844 采样"] --> B["CQT 变换 fmin=27.5Hz, 每八度36 bins, hop=256"]
+    B --> C["log 功率归一化 + BatchNorm"]
+    C --> D["HarmonicStacking 谐波堆叠 8 层 (0.5,1,2,3,4,5,6,7 倍频)"]
+    D --> F1["轮廓分支 conv_contour: Conv 8-8 (3x39) -> BN -> ReLU -> Conv 8-1 (5) -> Sigmoid"]
+    D --> F2["起始点分支 conv_onset_pre: Conv 8-32 (5, stride 1x3) -> BN -> ReLU"]
+    F1 --> G1["contour 输出: 时间x264, 音高轮廓, 1/3 半音分辨率"]
+    F1 -->|padding| H["音符分支 conv_note: Conv 1-32 (7, stride 1x3) -> ReLU -> Conv 32-1 (7x3) -> Sigmoid"]
+    H --> G3["note 输出: 时间x88, 88 个钢琴键的发音概率"]
     H --> F2
-    F2 --> I[拼接 note+onset 特征<br/>Conv33-1(3)→Sigmoid]
-    I --> G2[onset 输出: 时间×88<br/>88 个钢琴键的起始点概率]
+    F2 --> I["拼接 note+onset 特征: Conv 33-1 (3) -> Sigmoid"]
+    I --> G2["onset 输出: 时间x88, 88 个钢琴键的起始点概率"]
 ```
 
 三个输出分工：
