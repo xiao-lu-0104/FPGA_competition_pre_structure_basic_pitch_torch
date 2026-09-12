@@ -1,11 +1,13 @@
 # Basic Pitch (PyTorch) + 人声/吉他分离扒谱
 
-本项目包含两部分：
+本项目包含三部分：
 
 1. **Basic Pitch 的 PyTorch 复现**——Spotify 的轻量级音频转 MIDI 模型，预训练权重来自官方
    （TensorFlow 版转换而来），可直接用于任意音频的复音转谱。
-2. **人声+吉他同步扒谱管线**——先用 Demucs 把混音分离成人声轨和伴奏轨，再对每条轨分别跑
-   Basic Pitch 转写，一次得到**人声谱 + 吉他谱**两份 MIDI。
+2. **人声+吉他同步扒谱管线**（PC 端）——先用 Demucs 把混音分离成人声轨和伴奏轨，再对每条轨
+   分别跑 Basic Pitch 转写，一次得到**人声谱 + 吉他谱**两份 MIDI。
+3. **纯 FPGA 实时部署方案**——面向安路 PH1A180 的"零参数 DSP 分离 + 轻量 CNN 转谱"方案，
+   含完整实现文档与 ONNX 算子图（`docs/` 与 `models/`）。
 
 ## 文件结构
 
@@ -19,10 +21,16 @@ release/
 │   ├── note_creation.py             # 模型输出 → MIDI 后处理
 │   └── constants.py                 # 常量（采样率、频率 bin 等）
 ├── models/
-│   └── basic_pitch_pytorch_icassp_2022.pth   # 预训练权重（ICASSP 2022）
+│   ├── basic_pitch_pytorch_icassp_2022.pth  # 预训练权重（ICASSP 2022）
+│   ├── basic_pitch_heads.onnx       # 卷积主干 ONNX（含全部参数，70.8KB）★FPGA 用
+│   └── basic_pitch_full.onnx        # 完整模型 ONNX（含 CQT，供对照）
+├── docs/
+│   ├── FPGA_分离实现方案.md          # DSP 谐波掩码分离：数据流/资源/延迟/参数表
+│   └── FPGA_转谱实现方案.md          # Basic Pitch 转谱：CQT/卷积/量化/后处理方案
 ├── scripts/
 │   ├── transcribe.py                # 单轨转写：音频 → MIDI
 │   ├── separate_and_transcribe.py   # 两阶段：混音 → 人声 MIDI + 吉他 MIDI
+│   ├── export_onnx.py               # 导出 ONNX 算子图 + 数值校验
 │   └── show_structure.py            # 打印网络结构与参数量
 ├── audio/
 │   └── 吉他+人声.mp3                 # 演示用真实录音（约 77 秒）
@@ -167,6 +175,44 @@ flowchart TD
 | 吉他谱 `吉他+人声_guitar.mid` | 429 | 42~54 密集 | 低频密集，符合分解和弦伴奏形态 |
 
 分离出的 `vocals.wav` 与 `accompaniment.wav` 可直接试听核对分离质量。
+
+## FPGA 实时部署方案
+
+面向**纯 FPGA、流式实时、无 PC 参与**的场景（目标平台：安路 PH1A180-MLK-H10-CK203/204，
+TangDynasty 工具链），本项目提供完整方案。
+（PC 端管线的 Demucs 有 41M 参数，无法上 FPGA，因此分离改用**零参数 DSP 算法**。）
+
+```
+音频输入 → [DSP 谐波掩码分离] → [Basic Pitch 转谱] → [软核后处理] → MIDI
+           零参数、纯 FFT          16,782 参数 CNN        RISC-V 软核
+           延迟 < 100ms            0.5 秒块长
+```
+
+| 环节 | 方案 | 关键指标 |
+|------|------|---------|
+| 分离 | DSP 谐波掩码（FFT → 谐波筛法估 F0 → 掩码 → IFFT） | **零参数**；帧延迟 23ms；查找表 ROM 约 2.7KB |
+| 转谱 | Basic Pitch（INT8 量化） | **16,782 参数**；484M MAC / 2 秒窗口 |
+| 后处理 | 软核 CPU 跑 C 代码（移植自 `note_creation.py`） | 或简化为阈值 + 峰值状态机 |
+
+详细实现文档：
+
+- [`docs/FPGA_分离实现方案.md`](docs/FPGA_分离实现方案.md)——逐帧数据流、查找表设计、资源与延迟估算、参数速查表
+- [`docs/FPGA_转谱实现方案.md`](docs/FPGA_转谱实现方案.md)——CQT 多速率实现、逐层卷积参数表、量化方案、后处理接口
+
+ONNX 算子图（供硬件团队做 RTL 参考与量化仿真）：
+
+- `models/basic_pitch_heads.onnx`——**卷积主干**（含全部参数，输入 `(1,8,T,264)`），与 PyTorch 数值误差 < 1e-6
+- `models/basic_pitch_full.onnx`——完整模型（含 CQT，供对照）
+
+重新导出与自检：
+
+```powershell
+python scripts/export_onnx.py --out-dir models
+```
+
+> 分离质量客观评分（以 Demucs 为参考的 SI-SDR）：人声轨 **3.57 dB**、伴奏轨 -0.71 dB。
+> 零参数 DSP 分离存在物理上限（人声与吉他频率重叠处不可分），预期听感为"人声保留主旋律谐波、
+> 伴奏偏挖空"，请以"可实时、零参数、可用"为目标评估。
 
 ## 原理简述
 
