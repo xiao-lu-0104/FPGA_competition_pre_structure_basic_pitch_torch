@@ -1,14 +1,16 @@
-"""DSP 流式分离：谐波掩码法（FPGA 可实现版）。
+"""DSP 流式分离：平滑梳状掩码 + 不对称抑制（FPGA 可实现版）。
 
-全部算法都只用 FFT + 乘加，零参数、逐帧处理，对应 FPGA 数据流：
-    音频帧 -> FFT -> 谐波筛法估计 F0 -> 生成谐波掩码 -> 掩码相乘 -> IFFT
+全部算法只用 FFT + 查表 + 乘加，零参数、逐帧处理。FPGA 数据流：
+    音频帧 -> FFT -> 谐波筛法估计 F0 -> 生成两个梳状掩码 -> 掩码相乘 -> IFFT
 
-改进点（均为 FPGA 友好的低成本逻辑）：
-    1. F0 限制在人声音域（80-500Hz），谐波只取到 4kHz；
-    2. 掩码带软权重 + 时间中值平滑。
+相对初版的三项改进（均保持零参数、逐帧、低延迟）：
+    1. 硬掩码(0/1) -> **平滑梳状掩码**（按半音距离高斯衰减），人声更饱满；
+    2. 单掩码 -> **不对称掩码**：人声轨用窄梳状（少混吉他），伴奏轨用宽抑制（更狠挖人声），
+       代价是两轨之和不等于原混音，换取两轨互相泄漏显著下降；
+    3. 输出**响度归一化**，解决人声轨听起来偏小的问题。
 
 用法：
-    python finetune/dsp_separate.py --audio 混音.wav --out-dir 输出目录
+    python scripts/dsp_separate.py --audio 混音.wav --out-dir 输出目录
 """
 
 import argparse
@@ -27,9 +29,13 @@ HOP = 512
 F0_MIN = 80.0    # 人声基频下限 (Hz)
 F0_MAX = 500.0   # 人声基频上限 (Hz)
 F0_CANDIDATES = 48
-N_HARMONICS = 14
-MAX_HARMONIC_FREQ = 4500.0  # 谐波上限，避免拾取高频吉他泛音
-VOICING_THRESHOLD = 0.3     # 经参数扫描调优
+N_HARMONICS = 20
+MAX_HARMONIC_FREQ = 4500.0   # 人声轨保留的谐波上限
+SUPPRESS_FREQ = 6000.0       # 伴奏轨抑制人声的频段上限
+SIGMA_VOCAL = 0.40           # 人声轨梳状宽度（半音，越小越干净但越薄）
+SIGMA_SUPPRESS = 1.00        # 伴奏轨抑制宽度（半音，1.0=温和保吉他，1.5=强抑制更干净）
+VOICING_THRESHOLD = 0.15     # 经参数扫描调优
+VOCAL_GAIN_DB = -1.5         # 人声轨响度（相对原始混音 RMS，dB）
 
 
 def estimate_f0_sieve(mag: np.ndarray, freqs: np.ndarray):
@@ -87,33 +93,54 @@ def smooth_f0(f0: np.ndarray, voiced: np.ndarray, win: int = 5) -> np.ndarray:
     return f0_s
 
 
-def harmonic_mask_separate(y: np.ndarray, f0: np.ndarray, voiced: np.ndarray,
-                           n_harmonics: int = N_HARMONICS, soft: bool = False):
-    """生成谐波掩码并分离，返回 (人声轨, 伴奏轨, 掩码)。"""
-    D = librosa.stft(y, n_fft=N_FFT, hop_length=HOP)
-    freqs = librosa.fft_frequencies(sr=SR, n_fft=N_FFT)
-    mag = np.abs(D)
-    mask = np.zeros_like(mag)
+def comb_mask(freqs: np.ndarray, f0: np.ndarray, voiced: np.ndarray,
+              sigma: float = SIGMA_VOCAL, max_hz: float = MAX_HARMONIC_FREQ) -> np.ndarray:
+    """平滑梳状掩码：谐波中心权重 1，按半音距离做高斯衰减。
 
-    for t in range(mag.shape[1]):
+    FPGA 实现：把高斯曲线量化为 8 级查找表（按 bin 偏移查表加权），仍是查表 + 乘法。
+    """
+    n_bins, n_frames = len(freqs), len(f0)
+    mask = np.zeros((n_bins, n_frames), dtype=np.float32)
+    for t in range(n_frames):
         if not voiced[t] or f0[t] <= 0:
             continue
-        for h in range(1, n_harmonics + 1):
+        for h in range(1, N_HARMONICS + 1):
             fh = f0[t] * h
-            if fh > MAX_HARMONIC_FREQ:
+            if fh > max_hz:
                 break
-            # 谐波带宽：低次谐波稍宽，高次谐波更窄
-            width = 0.5 if h <= 4 else 0.35
-            lo = fh * 2 ** (-width / 12)
-            hi = fh * 2 ** (width / 12)
-            band = (freqs >= lo) & (freqs < hi)
-            # 软权重：谐波次数越高权重越低（人声能量集中在低次谐波）
-            w = 1.0 if not soft else max(0.35, 1.0 - 0.05 * (h - 1))
-            mask[band, t] = np.maximum(mask[band, t], w)
+            lo = fh * 2 ** (-3.0 * sigma / 12)
+            hi = fh * 2 ** (3.0 * sigma / 12)
+            idx = (freqs >= lo) & (freqs <= hi)
+            if not np.any(idx):
+                continue
+            d = 12.0 * np.log2(freqs[idx] / fh)
+            w = np.exp(-0.5 * (d / sigma) ** 2)
+            mask[idx, t] = np.maximum(mask[idx, t], w)
+    return mask
 
-    vocal = librosa.istft(D * mask, hop_length=HOP, length=len(y))
-    accomp = librosa.istft(D * (1.0 - mask), hop_length=HOP, length=len(y))
-    return vocal, accomp, mask
+
+def separate(y: np.ndarray):
+    """返回 (人声轨, 伴奏轨)。"""
+    D = librosa.stft(y, n_fft=N_FFT, hop_length=HOP)
+    freqs = librosa.fft_frequencies(sr=SR, n_fft=N_FFT)
+    f0_raw, conf = estimate_f0_sieve(np.abs(D), freqs)
+    voiced = conf > VOICING_THRESHOLD
+    f0_s = smooth_f0(f0_raw, voiced)
+
+    mask_vocal = comb_mask(freqs, f0_s, voiced, sigma=SIGMA_VOCAL, max_hz=MAX_HARMONIC_FREQ)
+    mask_suppress = comb_mask(freqs, f0_s, voiced, sigma=SIGMA_SUPPRESS, max_hz=SUPPRESS_FREQ)
+
+    vocal = librosa.istft(D * mask_vocal, hop_length=HOP, length=len(y))
+    accomp = librosa.istft(D * (1.0 - mask_suppress), hop_length=HOP, length=len(y))
+
+    # 响度归一化：人声轨对齐到目标电平，解决"听起来很小"的问题
+    target_rms = np.sqrt(np.mean(y**2)) * (10 ** (VOCAL_GAIN_DB / 20))
+    cur = np.sqrt(np.mean(vocal**2)) + 1e-9
+    vocal = vocal * (target_rms / cur)
+    peak = np.max(np.abs(vocal))
+    if peak > 0.99:  # 防削顶
+        vocal = vocal * (0.99 / peak)
+    return vocal, accomp
 
 
 def main() -> None:
@@ -128,14 +155,7 @@ def main() -> None:
     y, sr = librosa.load(args.audio, sr=SR, mono=True)
     print(f"音频 {len(y)/sr:.1f} 秒")
 
-    D = librosa.stft(y, n_fft=N_FFT, hop_length=HOP)
-    freqs = librosa.fft_frequencies(sr=SR, n_fft=N_FFT)
-    f0, conf = estimate_f0_sieve(np.abs(D), freqs)
-    voiced = conf > VOICING_THRESHOLD
-    f0_s = smooth_f0(f0, voiced)
-    print(f"F0 估计完成：有声帧 {np.sum(voiced)}/{len(voiced)}，平均 F0={np.mean(f0_s[voiced]):.1f} Hz")
-
-    vocal, accomp, mask = harmonic_mask_separate(y, f0_s, voiced)
+    vocal, accomp = separate(y)
 
     sf.write(str(out_dir / "vocals_dsp.wav"), vocal, SR)
     sf.write(str(out_dir / "accompaniment_dsp.wav"), accomp, SR)

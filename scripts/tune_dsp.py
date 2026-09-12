@@ -3,7 +3,7 @@
 评估方式：以 Demucs 分离结果为参考，计算 SI-SDR（人声轨 + 伴奏轨的平均值）。
 
 用法：
-    python finetune/tune_dsp.py --audio 混音.wav --ref-dir out_吉他人声
+    python scripts/tune_dsp.py --audio 混音.wav --ref-dir out_吉他人声
 """
 
 import argparse

@@ -1,7 +1,7 @@
 """以 Demucs 分离结果为参考，客观评分 DSP 分离质量（SI-SDR）。
 
 用法：
-    python finetune/eval_dsp.py --reference-dir out_吉他人声 --dsp-dir out_dsp
+    python scripts/eval_dsp.py --reference-dir out_吉他人声 --dsp-dir out_dsp
 """
 
 import argparse
