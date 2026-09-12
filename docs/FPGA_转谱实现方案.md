@@ -160,12 +160,12 @@ CQT 的 Q 值固定（Q ≈ 51），低频 bin 的时域核极长（27.5Hz 处�
 
 | 文件 | 内容 |
 |------|------|
-| `onnx_export/basic_pitch_heads.onnx` | **卷积主干算子图**（推荐用这个，70.8KB），输入 `(1,8,T,264)` |
-| `onnx_export/basic_pitch_full.onnx` | 完整模型（含 CQT，供对照，CQT 建议 RTL 实现） |
-| `finetune/export_onnx.py` | 导出脚本 + 逐层参数打印 + ONNX 数值验证 |
+| `models/basic_pitch_heads.onnx` | **卷积主干算子图**（推荐用这个，70.8KB），输入 `(1,8,T,264)` |
+| `models/basic_pitch_full.onnx` | 完整模型（含 CQT，供对照，CQT 建议 RTL 实现） |
+| `scripts/export_onnx.py` | 导出脚本 + 逐层参数打印 + ONNX 数值验证 |
 | `basic_pitch_torch/model.py` | PyTorch 参考实现（逐层与 ONNX 对应） |
 | `basic_pitch_torch/note_creation.py` | 后处理算法（软核 C 代码的移植来源） |
-| `release/scripts/transcribe.py` | PC 端参考结果生成（用于对比验证） |
+| `scripts/transcribe.py` | PC 端参考结果生成（用于对比验证） |
 
 **验证方法**：把同一段音频分别送 PC 模型和 FPGA，比较输出的三张热力图（逐元素误差）与
 最终 MIDI 音符事件（数量、音高、时间）。

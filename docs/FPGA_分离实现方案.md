@@ -112,10 +112,10 @@ flowchart LR
 
 ## 8. 验证代码
 
-- Python 原型：`finetune/dsp_separate.py`（与本方案逐步对应，可逐行对照）
-- 参数扫描：`finetune/tune_dsp.py`（复现第 6 节的最优配置）
-- 客观评分：`finetune/eval_dsp.py`
-- 输出示例：`out_dsp_final/vocals_dsp.wav`、`out_dsp_final/accompaniment_dsp.wav`
+- Python 原型：`scripts/dsp_separate.py`（与本方案逐步对应，可逐行对照）
+- 参数扫描：`scripts/tune_dsp.py`（复现第 6 节的最优配置）
+- 客观评分：`scripts/eval_dsp.py`
+- 用法：`python scripts/dsp_separate.py --audio 混音.wav --out-dir 输出目录`
 
 ## 9. 为什么能塞进 FPGA / 限制在哪
 
