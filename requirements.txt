@@ -8,3 +8,5 @@ mir_eval
 resampy
 soundfile
 demucs
+onnx
+onnxruntime
