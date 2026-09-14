@@ -1,4 +1,8 @@
-"""导出 Spleeter (PyTorch) 两个 stem 模型为 ONNX，并做数值校验。"""
+"""导出 Spleeter (PyTorch) 两个 stem 模型为 ONNX，并做数值校验。
+
+时间轴（dim=2）为动态维，可用任意 64 的倍数（64/128/256/512 帧）输入，
+方便硬件团队按自己的分块长度对拍。fre 轴固定 1024。
+"""
 
 import sys
 from pathlib import Path
@@ -31,19 +35,25 @@ def main() -> None:
             output_names=["masked_spectrogram"],
             opset_version=13,
             do_constant_folding=True,
+            dynamic_axes={"spectrogram": {0: "batch", 2: "frames"},
+                          "masked_spectrogram": {0: "batch", 2: "frames"}},
         )
         size_mb = path.stat().st_size / 1024 / 1024
 
         import onnxruntime as ort
 
         sess = ort.InferenceSession(str(path), providers=["CPUExecutionProvider"])
-        with torch.no_grad():
-            ref = model(dummy).numpy()
-        got = sess.run(None, {"spectrogram": dummy.numpy()})[0]
-        max_diff = float(np.abs(ref - got).max())
+        # 校验 512 帧与 128 帧（FPGA 推荐）两种分块
+        for T in (512, 128):
+            d = torch.randn(1, 2, T, 1024)
+            with torch.no_grad():
+                ref = model(d).numpy()
+            got = sess.run(None, {"spectrogram": d.numpy()})[0]
+            print(f"    T={T:4d} 帧  最大误差 {np.abs(ref - got).max():.2e}")
 
         n_params = sum(p.numel() for p in model.parameters())
-        print(f"{name:14s} 参数 {n_params:>12,} | ONNX {size_mb:6.1f} MB | 最大误差 {max_diff:.2e}")
+        print(f"{name:14s} 参数 {n_params:>12,} | ONNX {size_mb:6.1f} MB")
+
 
 
 if __name__ == "__main__":

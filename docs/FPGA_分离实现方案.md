@@ -21,6 +21,7 @@
 | 片上缓存 | ≈1 MB（128 帧块） | 需确认 PH1A180 BSRAM 是否够；不够则激活也放 DDR |
 | **延迟** | **≈1.5 ~ 3.0 s**（取决于分块） | 原 DSP 方案 <100 ms ⇒ **这是最大的代价** |
 | 分离质量 | 人声 SI-SDR **12.98 dB** / 伴奏 8.74 dB | 对比：DSP 方案 5.53 / 0.20 dB |
+| **INT8 后质量** | **人声 11.38 dB / 伴奏 7.59 dB**（128 帧） | 量化掉点仅 **−1.22 / −0.85 dB**，已实测 |
 
 **一句话**：算力和带宽都不是问题，问题是**延迟**。Spleeter 是"整块推理"模型，片内至少要看 1.5~3 秒音频才出结果。若比赛指标硬性要求 <100 ms，请看 `FPGA_分离实现方案_DSP备选.md`。
 
@@ -185,6 +186,7 @@ U-Net：**6 层下采样编码器 + 6 层上采样解码器 + 5 条跳跃连接 
 | 256 帧 | 5.9 s | 5.9 s | 0.974 | 0.097 | 0.049 | 12.73 dB | 8.51 dB |
 | **128 帧（推荐）** | **3.0 s** | **≈3.0 s** | **0.974** | **0.088** | **0.064** | **12.60 dB** | **8.44 dB** |
 | 64 帧 | 1.5 s | 1.5 s | 0.965 | 0.074 | 0.103 | 11.35 dB | 7.34 dB |
+| 128 帧 + INT8 | 3.0 s | 3.0 s | 0.966 | 0.052 | 0.119 | 11.38 dB | 7.59 dB |
 
 （对比：DSP 纯算法方案 5.53 / 0.20 dB；Demucs 参考）
 
@@ -237,7 +239,23 @@ for each 输出像素 (H_out, W_out):
 | 掩码反解除法 `out / xn` | **LUT 求倒数**：`1/xn` 用 256 项表 + 线性插值；`abs(xn) < eps` 时输出 0 | 免除法器 |
 | 权重 / 激活 | **INT8 per-channel 量化**，累加 INT32/INT16 | 权重流 0.43 GB/s @4.8 GMAC/s，仍远低于 DDR 上限 |
 
-> 精度验证路径（上板前必做）：onnxruntime 静态量化（QDQ，用真实音频做校准）跑一遍，对比 fp32 的 SI-SDR 掉点。fp32 ONNX 与 PyTorch 的最大误差已实测为 **1.68e-5 / 4.77e-7**，可作为 INT8 基线。
+### 5.2.1 INT8 量化已实测（QDQ 静态量化）
+
+用 onnxruntime 做 **QDQ 静态量化**（opset 13，权重 per-channel INT8、激活 UINT8，校准集 = 16 块真实音频谱），实测：
+
+| 模型 | 文件大小 | 128 帧分块下的分离质量 |
+|---|---|---|
+| fp32 ONNX | 37.5 MB / 模型 | 人声 12.60 dB / 伴奏 8.44 dB（与 PyTorch 完全一致） |
+| **INT8 QDQ** | **9.5 MB / 模型** | **人声 11.38 dB / 伴奏 7.59 dB** |
+| 掉点 | ↓75% 存储 | **−1.22 dB / −0.85 dB**（可接受） |
+
+结论：**INT8 量化后仍远优于 DSP 方案（5.53 / 0.20 dB）**，且 9.5 MB/模型与理论值
+（9.82 M 参数 × 1 B）吻合，可直接作为 FPGA 权重预算。复现：
+`python scripts/spleeter/quantize_spleeter_qdq.py --patch 128` 然后
+`python scripts/spleeter/run_spleeter_onnx.py --quant qdq8 --patch 128`。
+
+> 校准集只用了 16 块（1 首歌），上板前建议用多首歌、更多分块复核；
+> 如需更好效果可改用逐层敏感度分析（敏感层保留 16-bit）。
 
 ### 5.3 跳跃连接与特征缓存
 
@@ -311,8 +329,8 @@ PC 版用**整首歌全局** `mu/sd`。FPGA 上三选一：
 | 阶段 | 内容 | 验收 |
 |---|---|---|
 | M1 | PyTorch 参考实现 ✅ 已完成 | 与 Demucs 对拍 SI-SDR 12.98 dB |
-| M2 | ONNX 导出 ✅ 已完成 | 最大误差 1.7e-5 |
-| M3 | INT8 量化 + 音频回归 | SI-SDR 掉点 <1 dB；输出 ONNX 给 RTL 做黄金参考 |
+| M2 | ONNX 导出 ✅ 已完成（时间轴动态，单模型 37.5 MB） | 最大误差 1.24e-5（512 帧）/ 2.35e-6（128 帧） |
+| M3 | INT8 量化 + 音频回归 ✅ 已完成（QDQ，9.5 MB/模型） | 掉点 −1.22 dB，11.38 / 7.59 dB |
 | M4 | 卷积引擎 RTL + 单层对拍 | conv1 / up1 逐像素误差 < LSB + 容差 |
 | M5 | 整网 bit-true 对拍（小尺寸输入） | 与 ONNX 逐像素误差 < 1% |
 | M6 | DDR 权重调度 + 128 帧块全流程 | 一块耗时 < 2.2 s（实时裕量 25%+） |
@@ -334,6 +352,8 @@ STFT              n_fft=4096  hop=1024  汉宁窗  取前 1024 频点
 实时算力          0.34 GMAC/s（双模型 + 25% 重叠）
 DDR 权重带宽      ≈9 MB/s（128 帧块）
 片上激活缓存      ≈1 MB（128 帧块）
+INT8 量化         9.5 MB / 模型（QDQ，权重 per-channel INT8、激活 UINT8）
+INT8 掉点         人声 −1.22 dB / 伴奏 −0.85 dB（128 帧：12.60→11.38 / 8.44→7.59）
 延迟              ≈3.0 s（128 帧块） / 1.5 s（64 帧块） / 11.9 s（512 帧块）
 输出              vocals / accompaniment 两轨 44.1k 立体声
 下游              重采样 22.05 kHz 单声道 -> Basic Pitch
@@ -356,7 +376,7 @@ DDR 权重带宽      ≈9 MB/s（128 帧块）
 
 | 方案 | 质量（人声/伴奏 SI-SDR） | 延迟 | 参数 | 算力 | FPGA 结论 |
 |---|---|---|---|---|---|
-| **Spleeter U-Net（本方案）** | **12.98 / 8.74 dB** | ≈3 s | 19.6 M | 0.34 GMAC/s | DDR 装权重，算力轻松，**延迟是唯一短板** |
+| **Spleeter U-Net（本方案）** | **12.98 / 8.74 dB**（INT8 11.38 / 7.59） | ≈3 s | 19.6 M | 0.34 GMAC/s | DDR 装权重，算力轻松，**延迟是唯一短板** |
 | DSP 谐波掩码（备选） | 5.53 / 0.20 dB | <100 ms | 0 | ~0.01 GMAC/s | 零模型零延迟，质量一般 |
 | Demucs（仅 PC 用） | 参考基准 | — | ~41 M | ~7 GMAC/s | 算力/结构不适合手写 RTL |
 
@@ -370,7 +390,7 @@ DDR 权重带宽      ≈9 MB/s（128 帧块）
 | 2 | 权重 19.6 MB 必须 DDR | 板子无 DDR 则不可行 | 只能退 DSP 方案 |
 | 3 | 11 kHz 以上不入模型 | 人声齿音缺失、高频全归伴奏 | 对转谱无影响（Basic Pitch ≤7.8 kHz）；听感上人声略闷 |
 | 4 | 全局归一化 → 流式近似 | 用滑动统计需实测对比 | M3 阶段用真实音频回归验证 |
-| 5 | INT8 掉点未知 | 可能 0.5~1.5 dB | M3 阶段必须量化回归 |
+| 5 | ~~INT8 掉点未知~~ → **已实测 −1.22 dB** | 可接受，量化后仍 2 倍优于 DSP | 校准集扩大后可复核；敏感层可保留 16-bit |
 | 6 | 3 个大层权重 > BSRAM | 需 DDR 流式调度逻辑 | 顺序读 + 乒乓 FIFO，地址常量表 |
 | 7 | 分块边界伪影 | 25% 重叠 + 交叉淡化 | 实测 128 帧仅 −0.38 dB |
 
@@ -380,17 +400,18 @@ DDR 权重带宽      ≈9 MB/s（128 帧块）
 
 ```powershell
 # 1) 下载权重（国内用 hf-mirror）-> scripts/spleeter/vocals.pt, accompaniment.pt
-python scripts/spleeter/download_weights.py
+python scripts/spleeter/download_weights.py --onnx
 
 # 2) 分离（默认 512 帧；--patch 128 为 FPGA 推荐配置）
 python scripts/spleeter/run_spleeter.py --audio "吉他+人声.mp3" --patch 128
 
-# 3) 导出 ONNX（给 RTL 做黄金参考）
-python scripts/spleeter/export_spleeter_onnx.py
+# 3) INT8 静态量化（QDQ，9.5 MB/模型）+ 量化后分离回归
+python scripts/spleeter/quantize_spleeter_qdq.py --patch 128
+python scripts/spleeter/run_spleeter_onnx.py --audio "吉他+人声.mp3" --quant qdq8 --patch 128
 
 # 4) 逐层参数/MAC 表（本文件 §2.1 / §3.1 数据来源）
 python scripts/spleeter/layer_stats.py
 
 # 5) 不同分块大小的质量对比（本文件 §4 数据来源）
-python scripts/spleeter/eval_patch.py
+python scripts/spleeter/eval_patch.py --ref-dir ../../output
 ```

@@ -13,7 +13,7 @@
 
 | 环节 | 方案 | 关键指标 |
 |------|------|---------|
-| 分离 | **Spleeter 2stems U-Net**（预训练权重 + INT8 量化） | **19.6 M 参数 → 19.6 MB，必须外挂 DDR**；实时 **0.34 GMAC/s**（奇偶分解后）；**延迟约 3 秒** |
+| 分离 | **Spleeter 2stems U-Net**（预训练权重 + INT8 量化） | **19.6 M 参数 → INT8 9.5 MB/模型，必须外挂 DDR**；实时 **0.34 GMAC/s**（奇偶分解后）；**延迟约 3 秒**；INT8 后质量 11.38 / 7.59 dB |
 | 转谱 | Basic Pitch（INT8 量化） | **16,782 参数**；484M MAC / 2 秒窗口 |
 | 后处理 | 软核 CPU 跑 C 代码（移植自 `note_creation.py`） | 或简化为阈值 + 峰值状态机 |
 
@@ -42,7 +42,9 @@ release/
 │   │   ├── unet.py                  #   U-Net 定义（逐层对应分离文档 §2）
 │   │   ├── run_spleeter.py          #   分离推理（支持 --patch 选择分块大小）
 │   │   ├── download_weights.py      #   下载权重（hf-mirror），可 --onnx 直接导出 ONNX
-│   │   ├── export_spleeter_onnx.py  #   导出 ONNX（给 RTL 做黄金参考）
+│   │   ├── export_spleeter_onnx.py  #   导出 ONNX（时间轴动态，给 RTL 做黄金参考）
+│   │   ├── quantize_spleeter_qdq.py #   INT8 静态量化（QDQ，9.5 MB/模型）
+│   │   ├── run_spleeter_onnx.py     #   用 ONNX 跑分离（量化前后对比）
 │   │   ├── layer_stats.py           #   逐层参数/MAC 表（分离文档数据来源）
 │   │   └── eval_patch.py            #   分块大小 vs 质量（延迟取舍，分离文档 §4）
 │   ├── dsp_separate.py              # 备选分离方案 Python 参考实现
@@ -109,8 +111,8 @@ TangDynasty 工具链），本项目提供完整方案。
    **1.54 GMAC**；双模型实时（含 25% 重叠）只需 **0.34 GMAC/s**，与转谱（0.24 GMAC/s）同量级。
 2. **带宽不是问题**：19.6 MB 权重放 DDR，每次分块顺序读一遍，128 帧块时仅 ≈9 MB/s。
 3. **片上缓存只要 ≈1 MB**（128 帧块）：5 条跳跃连接 254 KB + 解码器中间张量 ≈500 KB + 输入谱 262 KB。
-4. **量化友好**：编码器 BN 可离线折叠进卷积，解码器 BN 化成逐通道 scale/shift，
-   LeakyReLU 用移位（0.2≈51/256），Sigmoid/倒数用 LUT。
+4. **量化友好**：已用 QDQ 静态量化实测（onnxruntime 校准）：**9.5 MB/模型，分离质量仅掉 1.22 / 0.85 dB**
+   （12.60→11.38 dB / 8.44→7.59 dB），编码器 BN 可离线折叠进卷积，LeakyReLU 用移位（0.2≈51/256）。
 5. **只处理 11 kHz 以下**：模型只吃前 1024 个频点，高频旁路给伴奏，转谱（≤7.8 kHz）不受影响。
 
 实测分离质量（vs Demucs 参考，SI-SDR）：**人声 12.98 dB / 伴奏 8.74 dB**，
@@ -124,7 +126,7 @@ TangDynasty 工具链），本项目提供完整方案。
 | **必须外挂 DDR** | 19.6 MB 权重远超片内 BSRAM；无 DDR 的板子不可行 |
 | **11 kHz 以上不入模型** | 人声齿音缺失、高频全归伴奏，人声听感略闷（对转谱无影响） |
 | **全局归一化需流式近似** | PC 版按整首歌算 mu/sd，FPGA 改用滑动统计（需实测回归） |
-| **INT8 掉点待验证** | 预期 0.5~1.5 dB，上板前需用 onnxruntime 量化后回归一次 |
+| **INT8 掉点已验证** | 实测 128 帧下掉 1.22 / 0.85 dB（12.60→11.38 / 8.44→7.59），仍为 DSP 方案的 2 倍以上；扩大校准集可再优化 |
 | **转谱有量化误差** | INT8 后音符判定阈值需重新标定，可能轻微漏音/增音 |
 | **CQT 是资源风险点** | 顶八度 36 个复数核频谱 ROM 约 288KB，可能超出片内 BRAM → 需外扩存储或用近似方案（需实测验证精度） |
 | **后处理需要软核** | 峰值检测/音符跟踪不适合纯 RTL，会占用 MCU 资源与开发时间 |
@@ -140,7 +142,8 @@ ONNX 算子图（供硬件团队做 RTL 参考与量化仿真）：
 
 - `models/basic_pitch_heads.onnx`——**转谱主干**（含全部参数，输入 `(1,8,T,264)`），与 PyTorch 数值误差 < 1e-6
 - `models/basic_pitch_full.onnx`——完整模型（含 CQT，供对照）
-- `scripts/spleeter/onnx/spleeter_{vocals,accompaniment}.onnx`——**分离模型**（各 37.5 MB，不入库）
+- `scripts/spleeter/onnx/spleeter_{vocals,accompaniment}.onnx`——**分离模型**（各 37.5 MB，时间轴动态，不入库）
+- `scripts/spleeter/onnx/spleeter_{vocals,accompaniment}_qdq8.onnx`——**分离模型 INT8 量化版**（各 9.5 MB，不入库）
 
 重新导出与自检：
 
